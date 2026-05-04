@@ -1,0 +1,129 @@
+#encoding:gbk
+'''
+
+趋势行情使用MACD策略，震荡行情使用KD策略
+
+'''
+import pandas as pd
+import numpy as np
+import talib
+def init(ContextInfo):
+	g=ContextInfo
+	#hs300成分股中sh和sz市场各自流通市值最大的前3只股票
+	ContextInfo.trade_code_list=['000651.SZ','601857.SH','600519.SH','000333.SZ','002415.SZ','000002.SZ']
+	ContextInfo.set_universe(ContextInfo.trade_code_list)
+	ContextInfo.accID = '6000000058'
+	#设定买入印花税为0，卖出印花税为0.0001，开仓手续费和平仓（平昨）手续费均为万三，平今手续费为0，最小手续费为5
+	commissionList = [0,0.0001,0.0003,0.0003,0,5]
+	ContextInfo.set_commission(0,commissionList)
+	ContextInfo.CMI_len = 10
+	ContextInfo.buy=False                                   #买进条件
+	ContextInfo.sell=False
+	ContextInfo.up=80                                       #kd卖出信号区间
+	ContextInfo.down=20                                     #kd买入信号区间
+	g.m=0
+	g.k=0
+	g.CMI_N = 50
+	
+def handlebar(ContextInfo):
+		#当前K线索引号
+	g=ContextInfo
+	d=ContextInfo.barpos
+	p = ContextInfo.get_net_value(d)                         #该索引策略回测的净值，后面绘图使用
+	#获取当前K线日期
+	today=timetag_to_datetime(ContextInfo.get_bar_timetag(d),'%Y-%m-%d')
+	#获取股票池中所有个股的51天历史收盘价数据
+	h_stocks=ContextInfo.get_history_data(51,'1d','close')
+	high_stocks=ContextInfo.get_history_data(51,'1d','high')
+	low_stocks=ContextInfo.get_history_data(51,'1d','low')
+	#获取持仓信息
+	holdings=get_holdings(ContextInfo.accID,'STOCK')
+	#获取账户总权益
+	totalvalue=get_totalvalue(ContextInfo.accID,'STOCK')
+	#等资金权重下，每只股票的分配金额
+	cash_per_stock=totalvalue/len(ContextInfo.trade_code_list)
+	
+	#分股票循环配置-------------------------------------------------------------------------------
+	for stk in ContextInfo.trade_code_list:  
+		#print(h_stocks[stk])
+		#=================计算CMI指数========================
+		h=h_stocks[stk][-ContextInfo.CMI_len:]
+		high=high_stocks[stk][-ContextInfo.CMI_len:]
+		low=low_stocks[stk][-ContextInfo.CMI_len:]
+		pre_h=h_stocks[stk][(-ContextInfo.CMI_len-1):-1]
+		pre_high=high_stocks[stk][(-ContextInfo.CMI_len-1):-1]
+		pre_low=low_stocks[stk][(-ContextInfo.CMI_len-1):-1]
+		if (max(high)-min(low))>0:
+			CMI = abs((h[-1]-h[0])/(max(high)-min(low)))*100     #计算CMI
+		elif (max(high)-min(low))<=0:
+			CMI =20
+		
+		#================趋势市场使用MACD策略=================
+		if CMI>g.CMI_N:
+			#获取个股昨日收盘价
+			g.m+=1
+			g.k=0
+			pc=h_stocks[stk][-1]
+			if stk in h_stocks.keys():
+				#长期移动平均线、短期移动平均线、慢速线
+				macd, macdsignal, macdhist = talib.MACD(np.array(h_stocks[stk]), fastperiod=period1, slowperiod=period2, signalperiod=period3)
+				#当快线DIF下穿慢线DEA（死叉）时平仓
+				if macdhist[-1]<0 and macdhist[-2]>0 and stk in holdings.keys():
+					order_shares(stk,-holdings[stk]*100,ContextInfo,ContextInfo.accID)
+				buynum = int(cash_per_stock/pc/100)*100
+				#当快线DIF上穿慢线DEA（金叉）时买进
+				if macdhist[-1]>0 and macdhist[-2]<0 and stk not in holdings.keys() and int(buynum/100)>=1:
+					order_shares(stk,buynum,ContextInfo,ContextInfo.accID)
+		
+		#================震荡市场使用KD策略=================
+		if CMI<g.CMI_N:
+			#获取相关K线价格 必须先通过 ContextInfo.set_universe() 设定基础股票池，获取历史行情数据是获取的是股票池中的历史行情数据
+			h_close=ContextInfo.get_history_data(30,'1d','close')   
+			h_high=ContextInfo.get_history_data(30,'1d','high')
+			h_low=ContextInfo.get_history_data(30,'1d','low')
+			h_open=ContextInfo.get_history_data(30,'1d','open')
+			##按股票循环处理
+			for stk in ContextInfo.trade_code_list:                 
+					#如果该股票价格序列等于30天，则计算指标，组合中一些股票可能停牌，没有30天数据
+				if len(h_close[stk])==30 and len(h_open[stk])==30 and len(h_high[stk])==30 and len(h_low[stk])==30: 
+						#print(h_close[stk])
+						 #将list转化为np.nadarray,浮点类型
+					c=np.array(h_close[stk][:-1],dtype=np.float)   
+					h=np.array(h_high[stk][:-1],dtype=np.float)
+					l=np.array(h_low[stk][:-1],dtype=np.float)
+					o=np.array(h_open[stk][:-1],dtype=np.float)
+					#计算K,D指标
+					slowk,slowd=talib.STOCH(h,l,c,fastk_period=fastk_period,
+					slowk_period=slowk_period,slowk_matype=0,
+					slowd_period=slowd_period,slowd_matype=0)
+					#如果d 在超买区>80，k小于d ，并持仓，
+					holdings=get_holdings(ContextInfo.accID,'STOCK')
+					if slowd[-1]>ContextInfo.up and slowk[-1]<slowd[-1] and stk in holdings.keys():
+						#卖出全部仓位
+						order_shares(stk,-holdings[stk]*100,ContextInfo,ContextInfo.accID)  
+					#如果d 在超卖区<20，k大于d ，
+					totalvalue=get_totalvalue(ContextInfo.accID,'STOCK')
+					#计算买入数量
+					buynum=int(cash_per_stock/h_close[stk][-1]/100)*100          
+					if totalvalue<cash_per_stock:
+						exit
+					elif slowd[-1]<ContextInfo.down and slowk[-1]>slowd[-1] and int(buynum/100)>=1 :
+						#买进相应仓位
+						order_shares(stk,buynum,ContextInfo,ContextInfo.accID)         
+
+#获取账户总权益m_dBalance
+def get_totalvalue(accountid,datatype):
+	result=0
+	resultlist=get_trade_detail_data(accountid,datatype,"ACCOUNT")
+	for obj in resultlist:
+		 result=obj.m_dAvailable  #：可用金额
+	return result
+
+#获取持仓信息{code.market:手数}
+def get_holdings(accountid,datatype):
+	holdinglist={}
+	resultlist=get_trade_detail_data(accountid,datatype,"POSITION")
+	for obj in resultlist:
+		holdinglist[obj.m_strInstrumentID+"."+obj.m_strExchangeID]=obj.m_nVolume/100
+	#返回{code.market:持仓手数}
+	return holdinglist

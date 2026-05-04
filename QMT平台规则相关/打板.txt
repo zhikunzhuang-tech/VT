@@ -1,0 +1,932 @@
+#coding:gbk
+
+import pandas as pd
+import time
+from datetime import datetime as dts
+import os
+import xml.etree.ElementTree as ET   # 用于解析XML文件
+import uuid  # 生成唯一标识符
+import requests
+import copy  # 深拷贝数据结构
+import json
+
+
+class a(): pass
+A = a()
+A.path1=os.path.abspath('.') #表示当前所处的文件夹的绝对路径
+A.path2=os.path.abspath('..') #表示当前所处的文件夹上一级文件夹的绝对路径
+A.path3 = A.path2+ '/python/'
+A.paras = {}		   # 初始化参数字典
+A.program_name = "打板策略V"
+A.version = "【3.01】"
+
+def setAccount(C):
+	try:
+		A.acct = str(account)
+		A.acct_type = str(accountType)
+	except NameError:
+		A.acct = '55013728'
+		A.acct_type = '测试模式'
+		
+	if A.acct_type == "CREDIT":
+		print('当前为信用账户')
+	elif A.acct_type =="STOCK":
+		print('当前为普通账户')
+	else:
+		print(f"账户类型:{C.accType}")
+
+def init(C):
+	setAccount(C) #获取账号和类型
+	get_paras()# 从XML文件读取参数
+
+	A.oscillation_judge = A.paras['oscillation_judge']  # 是否启用波动率判断
+	
+	A.buy_vs_traded_judge = A.paras['buy_vs_traded_judge']  # 封成比判断开关 
+	A.buy_vs_traded_threshold = A.paras['buy_vs_traded_threshold']   # 买量/成交量比例判断
+	A.volume_judge = A.paras['volume_judge']   # 成交量判断
+	A.dealed_volume_threshold = A.paras['dealed_volume_threshold']  # 成交量阈值（手）
+	A.amount_judge = A.paras['amount_judge']   # 成交金额判断
+	A.dealed_amount_threshold = A.paras['dealed_amount_threshold']   # 成交金额阈值（元）
+	# print('rrrrrrrrr', A.oscillation_judge,A.buy_vs_traded_judge, A.volume_judge, A.amount_judge)
+	
+	# 时间参数处理
+	A.start_time = A.paras['start_time'].replace('：', ':')   # 策略开始时间
+	A.end_time = A.paras['end_time'].replace('：', ':')	   # 策略结束时间
+	if len(A.start_time) == 7 and A.start_time[0] == '9':
+		A.start_time = '0' + A.start_time
+	if len(A.end_time) == 7 and A.end_time[0] == '9':
+		A.end_time = '0' + A.end_time
+	
+	# 资金管理参数
+	A.amount_for_buying = A.paras['buy_amount']  # 单笔最大买入金额限制
+	A.amount_for_buying = min(5e5,A.amount_for_buying ) # 限制单笔最大50万
+	A.amount_for_single_day = 5e6   # 单日最大买入金额500万
+	A.limited_num_of_stocks = A.paras['limited_num_of_stocks']  # 最大持仓只数
+	# 订单标识配置
+	A.buy_remark = A.program_name + A.version  # 订单备注（区分策略实例）
+	print(A.buy_remark)
+	A.counter_for_get_upstopprice = 0	# 涨停价获取次数计数器
+	A.counter_for_monitoring = 0		# 监控轮次计数器
+	
+	# 高级策略参数
+	A.after_running_upstop = A.paras['after_running_upstop']  # 是否排除已涨停股
+	A.askVol_or_askAmount = A.paras['askVol_or_askAmount']   # 卖单量/金额判断模式
+	A.bidVol_or_bidAmount = A.paras['bidVol_or_bidAmount']   # 买单量/金额判断模式
+	# 收盘价相关参数
+	A.close_rt = A.paras['close_rt']  # 接近涨停的幅度阈值
+	
+	# 账户类型判断（普通/信用）
+	A.available_cash = get_buying_amount()   # 获取可用资金
+	A.buy_code = 23 if A.acct_type == 'STOCK' else 33   # 普通/信用账户买入代码
+	A.sell_code = 24 if A.acct_type == 'STOCK' else 34  # 卖出代码
+	# A.lst_all = ths_zxg_reader(A.buy_file_path, C)
+	# print(A.lst_all)
+	
+	# print('len(A.lst_mainboard):', len(A.lst_mainboard))
+	
+	A.fake_round = 0
+	# 股票池初始化
+	lst_stocks = C.get_stock_list_in_sector('沪深A股')# 获取股票列表（不同板块）
+	A.lst_bjs = [x for x in lst_stocks if x[:1] in ['9','8','4']]  # 北交所
+	A.lst_hs_ashare = [x for x in lst_stocks if x[:1] not in ['9','8','4']]  # 沪深A股
+	A.lst_kcb = C.get_stock_list_in_sector('科创板')
+	A.lst_cyb = C.get_stock_list_in_sector('创业板')
+	A.lst_CVB = C.get_stock_list_in_sector('沪深转债')
+	A.lst_etf = C.get_stock_list_in_sector('沪深ETF')
+	A.lst_mainboard = list(set(A.lst_hs_ashare).difference(set(A.lst_cyb + A.lst_kcb)))  # 主板
+	# A.lst_all = list(set(A.lst_bjs + A.lst_hs_ashare + A.lst_CVB + A.lst_etf))
+	# A.lst_all = list(set(A.lst_hs_ashare))
+	
+	
+	# 股票池过滤
+	A.lst_program_stocks = []  # 程序化选股池
+	# 加载自选股列表
+	integrated_zxg_reader('监控', A.paras['stock_source'], A.paras['file_path'], C)
+	integrated_zxg_reader('排除', A.paras['stock_source_1'], A.paras['file_path_1'], C)
+	# 等待交易时段
+	while True:
+		now_time = str(dts.now())[11:19]  # 获取当前时间HH:MM:SS
+		if now_time < "09:10:00":   # 早于9:10等待
+			print(f"现在时间为{now_time}, 为时过早!待09:10:00之后，程序会自动继续运行")
+			time.sleep(5)   # 休眠5秒
+		else:
+			break
+	# 初始化订单查询
+	A.lst_ordered_buy, A.lst_all_ordered_vol_canceled = order_query()	# 查询当日订单
+	A.lst_ordered_buy = list(set(A.lst_ordered_buy).difference(set(A.lst_all_ordered_vol_canceled))) # 排除已撤单
+	
+	# full_tick = C.get_full_tick(A.lst_hs_ashare)
+	
+	
+	get_up_stop_price(C)   # 初始化各股涨停价
+	
+	# 板块过滤设置
+	if A.paras['buy_no_kcb_stocks']:  # 是否排除科创板
+		A.lst_hs_ashare = list(set(A.lst_hs_ashare).difference(set(A.lst_kcb)))
+		
+	
+	if A.paras['buy_no_cyb_stocks']:  # 是否排除创业板
+		A.lst_hs_ashare = list(set(A.lst_hs_ashare).difference(set(A.lst_cyb)))
+	
+	if A.paras['buy_no_ST_stocks']:   # 是否排除ST股
+		A.lst_hs_ashare = list(set(A.lst_hs_ashare).difference(set(A.lst_ST)))
+	# 数据比对初始化
+	A.counter_for_data_comparison = 0   # 数据比对计数器
+	A.dict_last_second_data = {}		# 上一秒行情快照
+	A.dict_explosion_judge = {}		 # 炸板判断字典
+	A.dict_explosion_time = {}		  # 炸板时间记录
+	# A.dict_up_stop_price = {}
+	# A.dict_floatVol = {}
+	# for stock_code in A.lst_hs_ashare:
+		# abc = C.get_instrumentdetail(stock_code)
+		# floatVol = abc["FloatVolumn"]
+		# up_stop_price = abc['UpStopPrice']
+		# A.dict_up_stop_price[stock_code] = round(up_stop_price,2)
+		# A.dict_floatVol[stock_code] = floatVol
+	
+	# for stock_code in A.dict_floatVol.keys():
+		# print(stock_code, A.dict_floatVol[stock_code])
+		
+	# 策略参数范围初始化
+	A.min_price_threshold = min(A.price_range)				  # 最低价格阈值
+	A.max_price_threshold = max(A.price_range)				  # 最高价格阈值
+	A.min_market_value_threshold = min(A.market_value_range)	# 最小市值
+	A.max_market_value_threshold = max(A.market_value_range)	# 最大市值
+	# print('444444444444444', A.open_vs_lastclose_range[1],type(A.open_vs_lastclose_range[1]))
+	
+	# print(A.min_price_threshold, A.max_price_threshold, A.min_market_value_threshold, A.max_market_value_threshold)
+	
+	# 未涨停股先设为空列表，以让集合竞价期间的用户也可以读取这个列表，待时间到达0925，在my_handlebar里面正式生成一下这个列表
+	# 涨停状态跟踪
+	A.lst_upstop_happened = []	  # 已涨停股票列表
+	A.lst_all_last_round = []	   # 上一轮全量股票
+	A.lst_condition_0_met = []	  # 满足条件0的股票
+	A.lst_condition_1_met = []	  # 满足条件1的股票
+	
+	# my_handlebar(C)
+	# download_data(C)
+	# return
+	# 撤单参数
+	A.cancel_seconds_interval = A.paras['cancel_seconds_interval']  # 撤单时间阈值
+	# A.cancel_volume_threshold = A.paras['cancel_volume_threshold']
+	# A.cancel_amount_threshold = A.paras['cancel_amount_threshold']
+	# A.cancel_buy_vs_traded_threshold = A.paras['cancel_buy_vs_traded_threshold']
+	A.time_1 = A.paras['cancel_all_orders_time'].replace('：', ':')	# 全撤时间
+	if len(A.time_1) == 7 and A.time_1[0] == '9':
+		A.time_1 = '0' + A.time_1
+		
+	# 设备验证
+			
+	# 定时任务设置
+	now_dt = dts.today().strftime("%Y-%m-%d")
+	C.run_time("my_handlebar", "1nSecond", "{} {}".format(now_dt, A.start_time)) # 按秒执行监控
+	C.run_time("cancel_all_orders", "1nDay", "{} {}".format(now_dt, A.time_1))	# 每日定时撤单
+
+
+def cancel_all_orders(C):
+	"""每日定时撤单功能"""
+	now_time = str(dts.now())[11:19]   # 获取当前时间（HH:MM:SS格式）
+	# 全撤单一次
+	# 全撤单功能开关判断
+	if A.paras['cancel_all_orders_once']:  # 检查配置参数是否开启全撤单
+		print(f'现在的时间是{now_time}，定时全撤单功能启动运行！')
+		# 可撤单时间段判断（三个有效时段）
+		if "09:15:00" < now_time < "09:20:00" or "09:25:00" < now_time < "09:30:00" or now_time < "14:57:00":
+			orders = get_trade_detail_data(A.acct, A.acct_type, 'order')  # 查询账户所有订单
+			for order in orders:
+				# 委托方向为买入(48=开多仓)，# 有效订单状态集合  # 匹配策略标识的订单
+				if order.m_nOffsetFlag == 48 and order.m_nOrderStatus in [48,49,50,51,52,55,86,255] and order.m_strRemark == A.buy_remark:
+					stock_code = order.m_strInstrumentID + '.' + order.m_strExchangeID # 构建完整股票代码
+					cancel(order.m_strOrderSysID, A.acct, A.acct_type, C)# 执行撤单操作
+					A.lst_all_ordered_vol_canceled.append(stock_code)  # 更新撤单记录列表
+					# 从待买列表中移除已撤单股票（使用集合差集）
+					A.lst_ordered_buy = list(set(A.lst_ordered_buy).difference(set(A.lst_all_ordered_vol_canceled)))
+					print('合同编号',order.m_strOrderSysID, '股票代码：', stock_code, order.m_strInstrumentName, '全撤单')
+					continue
+		else:
+			print("设定的'全撤单一次'的时间，不在可撤单的时间范围内,此次'定时全撤单'失败！")
+	else:
+		return
+
+
+
+
+def order_query():
+	"""查询当日订单状态"""
+	# 创建订单df空数据
+	df_orders = pd.DataFrame(columns = ['order_id', 'stock_code', 'display_name', 'order_type', 'order_time', 'order_volume', 'traded_volume', 'traded_price', 'order_status', 'order_remark'])
+	orders = get_trade_detail_data(A.acct, A.acct_type, 'order')  #获取订单
+	for dt in orders:
+		df_orders.loc[len(df_orders)] = [dt.m_strOrderSysID, dt.m_strInstrumentID + '.' + dt.m_strExchangeID, dt.m_strInstrumentName, dt.m_nOffsetFlag, dt.m_strInsertTime, dt.m_nVolumeTotalOriginal, dt.m_nVolumeTraded, dt.m_dTradedPrice, dt.m_nOrderStatus, dt.m_strRemark]
+	# 筛选出所有“非”废单的委托
+	df_buy_orders = df_orders[(df_orders['order_type'] == 48) & (df_orders['order_remark'] == A.buy_remark) & (df_orders['order_status'] != 57)]
+	lst_ordered_buy = df_buy_orders.stock_code.tolist() # 已委托股票
+	# 查询所有“已撤”, 因“部撤”的话，这只股票其实已经成交了一部分数量，应该算作当天的一只成交股票，只是成交股数比较少而已
+	lst_all_ordered_vol_canceled = df_orders.loc[(df_orders['order_type'] == 48) & (df_orders['order_remark'] == A.buy_remark) & (df_orders['order_status'].isin([54])), 'stock_code'].tolist()
+	return lst_ordered_buy, lst_all_ordered_vol_canceled
+
+
+def 查询持仓():
+	"""持仓函数，返回持仓DataFrame和股票代码列表"""
+	# 创建持仓数据框（定义列结构）
+	df_positions = pd.DataFrame(columns=[
+		'stock_code',	  # 完整股票代码（带交易所后缀）
+		'display_name',	# 证券名称
+		'volume',		  # 当前持仓量（股）
+		'can_use_volume',  # 可用持仓量（可卖数量）
+		'open_price'	   # 开仓均价
+	])
+	positions = get_trade_detail_data(A.acct, A.acct_type, 'position')  #查询持仓数据
+	for dt in positions:
+		df_positions.loc[len(df_positions)] = [dt.m_strInstrumentID + '.' + dt.m_strExchangeID, dt.m_strInstrumentName, dt.m_nVolume, dt.m_nCanUseVolume, dt.m_dOpenPrice ]
+	df_positions = df_positions[df_positions['volume'] > 0].reset_index(drop = True)# 过滤零持仓记录重建连续索引
+	lst_positions = df_positions['stock_code'].tolist()# 提取持仓股票代码列表
+	return df_positions, lst_positions
+
+
+def integrated_zxg_reader(source_type, stock_source, file_path, C): 
+	'''读取自选股'''
+	if source_type == '排除' and len(file_path) == 0:
+		A.lst_to_skip = []
+		return
+	if stock_source == '同花顺(远航)路径':
+		tree = ET.parse(file_path)  
+		root = tree.getroot()
+		lst_stocks = []
+		# 查找Block name为"打板"的内容
+		for block in root.findall('Block'):
+			if source_type == '监控':
+				if block.get('name') == '打板':
+					for security in block.findall('security'):
+						# print(f"Market: {security.get('market')}, Code: {security.get('code')}")
+						lst_stocks.append(security.get('code') + '.' + security.get('market')[1:3])
+					# print(lst_stocks)
+			else:
+				if block.get('name') == '打板排除':
+					for security in block.findall('security'):
+						# print(f"Market: {security.get('market')}, Code: {security.get('code')}")
+						lst_stocks.append(security.get('code') + '.' + security.get('market')[1:3])
+
+	elif stock_source == '同花顺(免费)路径':
+		with open(file_path, 'r', encoding='gbk') as f:
+			lines = f.readlines()
+			# 如果有空行，会认为股票代码是一个回车换行，所以删除掉这个回车换行
+			lines = [x[1:] for x in lines if len(x) >= 6]
+			# print(lines)
+			data = [line.split("|") for line in lines]
+			lst_codes = data[0]
+			lst_stocks = []
+			for code in lst_codes:
+				if len(code) > 6:
+					code = code[-6:]
+					
+				elif len(code) == 6:
+					code = code
+				elif len(code) < 6:
+					continue
+				lst_stocks.append(code)
+			# print(lst_stocks)
+			lst_stocks = [x + '.SH' if x.startswith('6') else x + '.SZ' for x in lst_stocks] # 整理股票代码
+	
+	elif stock_source == '通达信(普及)路径':
+		with open(file_path, 'r', encoding='gbk') as f:
+			lines = f.readlines()
+			# 如果有空行，会认为股票代码是一个回车换行，所以删除掉这个回车换行
+			lines = [x[1:] for x in lines if len(x) >= 6]
+			lst_stocks = [line.split()[0] for line in lines]
+			lst_stocks = [x + '.SH' if x.startswith('6') else x + '.SZ' for x in lst_stocks] # 整理股票代码
+	
+	elif stock_source == 'QMT(板块名)':
+		lst_stocks = C.get_stock_list_in_sector(file_path)
+	
+	# lst_stocks = [x for x in lst_stocks if x[:1] not in ['9','8','4']] # 排除北交所股票
+	lst_stocks = list(set(A.lst_hs_ashare)&(set(lst_stocks)))
+	if source_type == '监控':
+		A.lst_all = lst_stocks
+		print(f"监控股票为{len(A.lst_all)}只")
+	elif source_type == '排除':
+		A.lst_to_skip = lst_stocks
+		print(f"排除股票为{len(A.lst_to_skip)}只")
+	# print(f"前5只为：{A.lst_all[:5]}")
+	
+	return 
+
+def get_up_stop_price(C):
+	time11 = time.time()
+	# integrated_zxg_reader('监控', A.paras['stock_source'], A.paras['file_path'], C)
+	# print('所需要监控的股票数为：%s只' % len(A.lst_all))
+	
+	if A.counter_for_get_upstopprice == 0: # 首次启动或重启动，则把所有板块内股票都查询一遍
+		A.dict_up_stop_price = {}
+		A.dict_floatVol = {}
+		A.lst_ST = []
+		for stock_code in A.lst_hs_ashare:
+			abc = C.get_instrumentdetail(stock_code)
+			up_stop_price = abc['UpStopPrice']
+			floatVol = abc["FloatVolumn"]
+			display_name = abc['InstrumentName']
+			if type(display_name) != str:
+				print(stock_code, '未取到涨停价, 跳过此股')
+				A.lst_program_stocks.append(stock_code)
+				continue
+			if 'ST' in display_name:
+				A.lst_ST.append(stock_code)
+			# print(stock_code, type(up_stop_price) == float)
+			if type(up_stop_price) != float:
+				print(stock_code, '未取到涨停价, 跳过此股')
+				A.lst_program_stocks.append(stock_code)
+				continue
+			if type(floatVol) not in [float, int]:
+				print(stock_code, '未取到流通市值, 跳过此股')
+				A.lst_program_stocks.append(stock_code)
+				continue
+			A.dict_up_stop_price[stock_code] = round(up_stop_price,2)
+			A.dict_floatVol[stock_code] = floatVol
+		A.lst_program_stocks = list(set(A.lst_program_stocks))
+		time22 = time.time()
+		consumed_time = time22 - time11
+		A.counter_for_get_upstopprice += 1
+		print('取涨停价耗时: %.2f秒' %consumed_time)
+		print('自本次启动以来第%s次获取涨跌停价格' % A.counter_for_get_upstopprice)
+			
+	else:
+		return
+	
+ 
+def get_buying_amount():
+	'''获取可用资金'''
+	account = get_trade_detail_data(A.acct, A.acct_type, 'account')
+	if len(account)==0:
+		print(f'账号{A.acct} 未登录 请检查')
+		return
+	account = account[0]
+	print('账户可用资金为：%s 元' % account.m_dAvailable)
+	return account.m_dAvailable
+
+def over_time(order, now_time, now, order_time, seconds_threshold):
+	if (order.m_strInsertTime <= '113000' and  now_time.replace(':', '') <= '113000') or (order.m_strInsertTime >= '130000' and  now_time.replace(':', '') >= '130000'):
+		seconds = (now - order_time).seconds #当前日期时间-委托日期时间,获取秒数时间差
+	elif order.m_strInsertTime <= '113000' and  now_time.replace(':', '') >= '130000':
+		seconds = (now - order_time).seconds - 5400#当前日期时间-委托日期时间,获取秒数时间差
+	# print(second)
+	if seconds > seconds_threshold:
+		return True
+	else:
+		return False
+
+def over_time_to_explosion(stock_code, now_time, now, explosion_time):
+	if (A.dict_explosion_time[stock_code][-6:] <= '113000' and  now_time.replace(':', '') <= '113000') or (A.dict_explosion_time[stock_code][-6:] >= '130000' and  now_time.replace(':', '') >= '130000'):
+		seconds = (now - explosion_time).seconds #当前日期时间-委托日期时间,获取秒数时间差
+	elif A.dict_explosion_time[stock_code][-6:] <= '113000' and  now_time.replace(':', '') >= '130000':
+		seconds = (now - explosion_time).seconds - 5400#当前日期时间-委托日期时间,获取秒数时间差
+	# print(second)
+	if A.explosion_rt_and_seconds[2] < seconds < A.explosion_rt_and_seconds[3]:
+		return True
+	else:
+		return False
+
+
+
+def my_handlebar(C):
+	"""逐笔交易处理函数"""
+
+	now_time = str(dts.now())[11:19]
+	today = str(dts.now())[:10]
+	time11 = time.time()  # 记录处理开始时间
+	# 交易规则时间控制
+	if now_time < "09:15:00" or now_time > "15:00:00" or "11:30:00" < now_time < "13:00:00":
+		print('当前时间在交易所交易时间之外')
+		return
+	# 用户时间控制
+	if now_time < A.start_time or now_time > A.end_time:
+		print('当前时间在用户设定的时间段之外')
+		return
+	
+	print(f"极速打板策略{A.version}号，模式为【{A.paras['upstop_type']}】")
+	# get_up_stop_price(C)
+	integrated_zxg_reader('监控', A.paras['stock_source'], A.paras['file_path'], C)
+	integrated_zxg_reader('排除', A.paras['stock_source_1'], A.paras['file_path_1'], C)
+	
+	
+	A.full_tick = C.get_full_tick(A.lst_hs_ashare)  # 获取沪深A股
+	if A.paras['upstop_type'] in ['D1一字炸封', 'D2非一炸封', 'D3所有炸封']:
+		# 当A.counter_for_data_comparison等于0时，只copy一次数据，等下一轮再进行循环判断炸板的买入
+		if A.counter_for_data_comparison == 0:  # 首次运行
+			A.dict_last_second_data = copy.deepcopy(A.full_tick)  # 深拷贝行情
+			A.counter_for_data_comparison = 1
+			print("第一轮，取数，跳过")
+			return
+		
+		
+	# print('检测前：')
+	# print('A.lst_all:', A.lst_all)
+	# print('A.lst_all_last_round:', A.lst_all_last_round )
+	# print('A.lst_upstop_happened:', A.lst_upstop_happened)
+	
+	
+	
+	# 运行或新加入以来，未涨停股的检查
+	if now_time >= "09:25:01":
+		# 找到在需要监控的股票中，其中没有检测过涨停情况的品种
+		lst_need_to_examine_upstop = list(set(A.lst_all).difference(set(A.lst_all_last_round)))
+		# print(f"本轮需要监测的股票为{lst_need_to_examine_upstop}")
+		if len(lst_need_to_examine_upstop) > 0:
+			for stock_code in lst_need_to_examine_upstop:
+				# print(stock_code, round(A.full_tick[stock_code]['lastPrice'],2))
+				#是否触及涨停
+				if round(A.full_tick[stock_code]['lastPrice'],2) == A.dict_up_stop_price[stock_code] or round(A.full_tick[stock_code]['high'],2) == A.dict_up_stop_price[stock_code]:
+					A.lst_upstop_happened.append(stock_code)
+			A.lst_upstop_happened = list(set(A.lst_upstop_happened) & set(A.lst_all))  # 更新检测记录
+		# print(f"其中,涨停过的有{len(A.lst_upstop_happened)}只，他们是{A.lst_upstop_happened}")
+			
+			# print('44444444', len(A.lst_upstop_happened))
+	
+	# 检测完之后，本轮检测的股票赋值给 A.lst_all_last_round
+	A.lst_all_last_round = A.lst_all
+	# print('检测后：')
+	# print('A.lst_all:', A.lst_all)
+	# print('A.lst_all_last_round:', A.lst_all_last_round)
+	# print('A.lst_upstop_happened:', A.lst_upstop_happened)
+	# print('\n')
+	
+	A.available_cash = get_buying_amount()#获取可用资金
+	df_positions, lst_positions = 查询持仓()#持仓查询函数
+	
+	orders = get_trade_detail_data(A.acct, A.acct_type, 'order')  #查询一遍订单 
+	
+	"""
+	9:15-9:20，投资者可以挂单也可以撤单。（但是因为此时间段下的单不会成交，所以可能造成反复撤单，所以此处就不做撤单）
+	9:20-9:25，投资者只能挂单，不能撤单。
+	9:25-9:30，投资者可以挂单也可以撤单，但单子不会报到交易系统，9:30分后才能进入交易系统。
+	14:57-15:00，收盘集合竞价阶段，可以挂单，不可以撤单。
+	其他非交易时间段，如8:40-9:15、9:25-9:30、11:30-13:00、15:00-15:03，交易系统支持接收撤单委托，但具体撤单效果取决于交易所的开市情况。
+	"""
+	#各种撤单
+	if "09:25:00" < now_time < "11:30:00" or "13:00:00" < now_time < "14:57:00":
+		now = dts.now() #获取当前日期时间
+		for order in orders:
+			stock_code = order.m_strInstrumentID + '.' + order.m_strExchangeID
+			if order.m_nOffsetFlag == 48 and order.m_nOrderStatus in [48,49,50,51,52,55,86,255] and order.m_strRemark == A.buy_remark:
+				order_time = order.m_strInsertDate + ' ' + order.m_strInsertTime #委托日期+委托时间
+				# order_time = '20240828 203600'
+				order_time = dts.strptime(order_time,'%Y%m%d %H%M%S') #委托日期时间字符串解析成日期时间对象
+				
+				# 超时撤单
+				if A.paras['cancel_order_by_time']:
+					# 判断是否超时的函数over_time
+					seconds_threshold = A.cancel_seconds_interval
+					if over_time(order, now_time, now, order_time, seconds_threshold):
+						#买入委托超时，撤单
+						cancel(order.m_strOrderSysID, A.acct, A.acct_type, C)
+						if order.m_nOrderStatus != 55:
+							A.lst_all_ordered_vol_canceled.append(stock_code)
+						
+						print('合同编号',order.m_strOrderSysID, order.m_strInstrumentName, '超时%s秒撤单' % A.cancel_seconds_interval)
+						continue
+				
+				# 封单【量】小于设定值则撤单
+				if A.paras['cancel_order_by_volume']:
+					if round(A.full_tick[stock_code]['bidPrice'][0],2) == A.dict_up_stop_price[stock_code]:
+						upstop_volume = A.full_tick[stock_code]['bidVol'][0]
+						seconds_threshold = A.cancel_volume_threshold[1]
+						if upstop_volume < A.cancel_volume_threshold[0] and over_time(order, now_time, now, order_time, seconds_threshold):
+							cancel(order.m_strOrderSysID, A.acct, A.acct_type, C)
+							if order.m_nOrderStatus != 55:
+								A.lst_all_ordered_vol_canceled.append(stock_code)
+							
+							print('合同编号',order.m_strOrderSysID, order.m_strInstrumentName, '封单量小于%s手, 撤单' % A.cancel_volume_threshold)
+							continue
+					
+				# 封单【金额】小于设定值则撤单
+				if A.paras['cancel_order_by_amount']:
+					if round(A.full_tick[stock_code]['bidPrice'][0],2) == A.dict_up_stop_price[stock_code]:
+						upstop_amount = A.full_tick[stock_code]['bidVol'][0] * 100 * round(A.full_tick[stock_code]['bidPrice'][0],2)
+						seconds_threshold = A.cancel_amount_threshold[1]
+						if upstop_amount < A.cancel_amount_threshold[0] and over_time(order, now_time, now, order_time, seconds_threshold):
+							cancel(order.m_strOrderSysID, A.acct, A.acct_type, C)
+							if order.m_nOrderStatus != 55:
+								A.lst_all_ordered_vol_canceled.append(stock_code)
+							
+							print('合同编号',order.m_strOrderSysID, order.m_strInstrumentName, '封单金额小于%s元, 撤单' % A.cancel_amount_threshold)
+							continue
+				
+				# 【封成比】小于设定值则撤单
+				if A.paras['cancel_order_by_buy_vs_traded_rt']:
+					if round(A.full_tick[stock_code]['bidPrice'][0],2) == A.dict_up_stop_price[stock_code]:
+						buy_vs_traded_rt = A.full_tick[stock_code]['bidVol'][0] / A.full_tick[stock_code]['volume']
+						seconds_threshold = A.cancel_buy_vs_traded_threshold[1]
+						if buy_vs_traded_rt < A.cancel_buy_vs_traded_threshold[0] and over_time(order, now_time, now, order_time, seconds_threshold):
+							cancel(order.m_strOrderSysID, A.acct, A.acct_type, C)
+							if order.m_nOrderStatus != 55:
+								A.lst_all_ordered_vol_canceled.append(stock_code)
+							
+							print('合同编号',order.m_strOrderSysID, order.m_strInstrumentName, '封成比%s, 撤单' % A.cancel_buy_vs_traded_threshold)
+							continue
+		# 循环结束，统一整理一次
+		A.lst_ordered_buy = list(set(A.lst_ordered_buy).difference(set(A.lst_all_ordered_vol_canceled)))
+		A.lst_ordered_buy = list(set(A.lst_ordered_buy))
+	now = dts.now() #获取当前日期时间
+	n = 0
+	for stock_code in A.lst_all:
+		# print('5555555555', stock_code)
+		n += 1
+		
+		# print(round(A.full_tick[stock_code]['lastPrice'],2) , A.dict_up_stop_price[stock_code])
+		
+		if len(A.lst_ordered_buy) >= A.limited_num_of_stocks:
+			print('下单只数超限, 停止买入')
+			return
+		if A.available_cash < A.amount_for_buying:
+			print('资金不足, 停止买入')
+			return
+		if A.amount_for_buying * len(A.lst_ordered_buy) > A.amount_for_single_day:
+			print('当日下单总金额超限, 停止买入')
+			return
+		if stock_code in A.lst_ordered_buy:  #如果已买
+			continue
+		if stock_code in A.lst_all_ordered_vol_canceled:  #如果成交的部分
+			continue
+		if stock_code in A.lst_to_skip:  #排除的股票
+			continue
+		if A.paras['buy_no_positioned_stock']:
+			# print(lst_positions)
+			if stock_code in lst_positions:  #持仓的股票列表
+				continue
+		# if round(A.full_tick[stock_code]['bidPrice'][0],2) == 0: # 跌停的股票跳过
+			# continue
+		
+		# print(stock_code, round(A.full_tick[stock_code]['lastPrice'],2) == A.dict_up_stop_price[stock_code])
+		if A.paras['upstop_type'] == 'A排板(非一字板)' and round(A.full_tick[stock_code]['bidPrice'][0],2) == A.dict_up_stop_price[stock_code] and round(A.full_tick[stock_code]['open'],2) != A.dict_up_stop_price[stock_code] and round(A.full_tick[stock_code]['low'],2) != A.dict_up_stop_price[stock_code]:
+			if A.paras['bigger_or_smaller'] == '排板(手数)大于':
+				if A.full_tick[stock_code]['bidVol'][0] > A.bidVol_or_bidAmount:
+					pass
+				else:
+					continue
+			elif A.paras['bigger_or_smaller'] == '排板(手数)小于':
+				if A.full_tick[stock_code]['bidVol'][0] < A.bidVol_or_bidAmount:
+					pass
+				else:
+					continue
+			elif A.paras['bigger_or_smaller'] == '排板(金额)大于':
+				if A.full_tick[stock_code]['bidVol'][0] * 100 * round(A.full_tick[stock_code]['bidPrice'][0],2) > A.bidVol_or_bidAmount:
+					pass
+				else:
+					continue
+			elif A.paras['bigger_or_smaller'] == '排板(金额)小于':
+				if A.full_tick[stock_code]['bidVol'][0] * 100 * round(A.full_tick[stock_code]['bidPrice'][0],2) < A.bidVol_or_bidAmount:
+					pass
+				else:
+					continue
+			
+		
+		elif A.paras['upstop_type'] == 'B排板(含一字板)' and round(A.full_tick[stock_code]['bidPrice'][0],2) == A.dict_up_stop_price[stock_code]:
+			if A.paras['bigger_or_smaller'] == '排板(手数)大于':
+				if A.full_tick[stock_code]['bidVol'][0] > A.bidVol_or_bidAmount:
+					pass
+				else:
+					continue
+			elif A.paras['bigger_or_smaller'] == '排板(手数)小于':
+				if A.full_tick[stock_code]['bidVol'][0] < A.bidVol_or_bidAmount:
+					pass
+				else:
+					continue
+			elif A.paras['bigger_or_smaller'] == '排板(金额)大于':
+				if A.full_tick[stock_code]['bidVol'][0] * 100 * round(A.full_tick[stock_code]['bidPrice'][0],2) > A.bidVol_or_bidAmount:
+					pass
+				else:
+					continue
+			elif A.paras['bigger_or_smaller'] == '排板(金额)小于':
+				if A.full_tick[stock_code]['bidVol'][0] * 100 * round(A.full_tick[stock_code]['bidPrice'][0],2) < A.bidVol_or_bidAmount:
+					pass
+				else:
+					continue
+		
+		
+		elif A.paras['upstop_type'] == 'C1扫板(含一字)' or (A.paras['upstop_type'] == 'C2扫板(非一字)' and round(A.full_tick[stock_code]['open'],2) != A.dict_up_stop_price[stock_code]):
+			# print(A.bidVol_or_bidAmount, type(A.bidVol_or_bidAmount))
+			price_position = int(A.paras['approching_0'][1])
+			
+			# 已涨停
+			if round(A.full_tick[stock_code]['bidPrice'][0],2) == A.dict_up_stop_price[stock_code]:
+				pass
+			
+			# 未涨停
+			else:
+				# 截位置
+				lst_prices = [round(x, 2) for x in A.full_tick[stock_code]['askPrice'][:price_position]]
+				if '手数' in A.paras['approching_0']:
+					if A.dict_up_stop_price[stock_code] in lst_prices and sum(A.full_tick[stock_code]['askVol'][:5]) < A.askVol_or_askAmount:
+						pass
+					else:
+						continue
+				elif '金额' in A.paras['approching_0']:
+					if A.dict_up_stop_price[stock_code] in lst_prices and sum(A.full_tick[stock_code]['askVol'][:5]) * 100 * A.full_tick[stock_code]['lastPrice'] < A.askVol_or_askAmount:
+						pass
+					else:
+						continue
+		
+		# 清空炸板列表只有两种情况，一是在下单时，一是在发生炸板时（进入下一轮炸板判断）
+		elif A.paras['upstop_type'] in ['D1一字炸封', 'D2非一炸封', 'D3所有炸封']:
+			"""
+			fake_dict = {}
+			fake_dict['high'] = 7.71
+			fake_dict['open'] = 7.71
+			fake_dict['lastClose'] = 7.01
+			if A.fake_round == 0:
+				fake_dict['lastPrice'] = 7.71
+				fake_dict['bidPrice'] = [7.71]
+			elif A.fake_round == 1:
+				fake_dict['lastPrice'] = 7.71
+				fake_dict['bidPrice'] = [7.71]
+			elif A.fake_round == 2:
+				fake_dict['lastPrice'] = 7.71
+				fake_dict['bidPrice'] = [7.70]
+			elif A.fake_round == 3:
+				fake_dict['lastPrice'] = 7.67
+				fake_dict['bidPrice'] = [7.65]
+			elif A.fake_round == 4:
+				fake_dict['lastPrice'] = 7.71
+				fake_dict['bidPrice'] = [7.71]
+			elif A.fake_round == 5:
+				fake_dict['lastPrice'] = 7.71
+				fake_dict['bidPrice'] = [7.71]
+			elif A.fake_round > 5:
+				fake_dict['lastPrice'] = 7.71
+				fake_dict['bidPrice'] = [7.70]
+			
+			A.full_tick['002278.SZ'] = fake_dict
+			# print(A.full_tick['002278.SZ'])
+			"""
+			
+			# print('yyyyyyyyyyyyyyy', stock_code, '当前价：', round(A.full_tick[stock_code]['lastPrice'], 2) )
+			# 当前价为涨停价
+			if round(A.full_tick[stock_code]['bidPrice'][0], 2) == A.dict_up_stop_price[stock_code]:
+				A.dict_explosion_judge[stock_code] = 0
+				# print(stock_code, '允许下单11')
+				# 之前发生过涨停，则允许下单
+				if stock_code in A.lst_condition_0_met and stock_code not in A.lst_condition_1_met:
+					
+					explosion_time = A.dict_explosion_time[stock_code]
+					print(stock_code, 'explosion_time:', explosion_time)
+					# order_time = '20240828 203600'
+					explosion_time = dts.strptime(explosion_time,'%Y%m%d %H%M%S') #日期时间字符串解析成日期时间对象
+					if over_time_to_explosion(stock_code, now_time, now, explosion_time):
+						print(stock_code,  '当前价：', round(A.full_tick[stock_code]['bidPrice'][0], 2), '炸板时间:', explosion_time, '满足回封时间设定,允许下单')
+						pass
+					else:
+						print(stock_code,  '当前价：', round(A.full_tick[stock_code]['bidPrice'][0], 2), '炸板时间:', explosion_time, '不满足回封时间设定,不允许下单')
+						A.lst_condition_0_met.remove(stock_code)
+						continue
+				else:
+					continue
+			# 上一轮价格为涨停价，当前价非涨停价，而high等于涨停价，开始进入炸板状态判断
+			else:
+				if round(A.dict_last_second_data[stock_code]['bidPrice'][0], 2) == A.dict_up_stop_price[stock_code] and round(A.full_tick[stock_code]['bidPrice'][0], 2) != A.dict_up_stop_price[stock_code]:
+					if stock_code in A.lst_condition_0_met:
+						A.lst_condition_0_met.remove(stock_code)
+					if stock_code in A.lst_condition_1_met:
+						A.lst_condition_1_met.remove(stock_code)
+					A.dict_explosion_judge[stock_code] = 1
+					A.dict_explosion_time[stock_code] = today.replace('-', '') + ' ' + now_time.replace(':', '')
+					# explosion_time = '20240828 203600'
+					print(stock_code, '发现炸板', A.lst_condition_0_met, A.lst_condition_1_met, A.dict_explosion_judge[stock_code])
+				# else:
+					# continue
+				if stock_code in list(A.dict_explosion_judge.keys()) and A.dict_explosion_judge[stock_code] == 1 \
+					and round(A.full_tick[stock_code]['high'], 2) == A.dict_up_stop_price[stock_code] and round(A.full_tick[stock_code]['bidPrice'][0],2) != A.dict_up_stop_price[stock_code]:
+					if (A.paras['upstop_type']  == 'D1一字炸封' and round(A.full_tick[stock_code]['open'], 2) == A.dict_up_stop_price[stock_code]) \
+						or (A.paras['upstop_type']  == 'D2非一炸封' and round(A.full_tick[stock_code]['open'], 2) != A.dict_up_stop_price[stock_code]) \
+						or A.paras['upstop_type']  == 'D3所有炸封':
+						# 如果设置为0.02，则主板股票，0.1 - 0.02 = 0.08，则涨幅大于0.08就下单买入了
+						# print('xxxxxxxxx', stock_code, round(A.full_tick[stock_code]['high'], 2), A.dict_up_stop_price[stock_code] and round(A.full_tick[stock_code]['lastPrice'],2))
+						
+						rt_threshold_0 = A.dict_up_stop_price[stock_code] / A.full_tick[stock_code]['lastClose'] - 1 - A.explosion_rt_and_seconds[0]
+						rt_threshold_1 = A.dict_up_stop_price[stock_code] / A.full_tick[stock_code]['lastClose'] - 1 - A.explosion_rt_and_seconds[1]
+						print(stock_code, '炸板幅度判断', 'lastPrice:', round(A.full_tick[stock_code]['lastPrice'],2), '边界1:', round(rt_threshold_0,3), '边界2:', round(rt_threshold_1, 2), '当前炸板幅度:', round(A.full_tick[stock_code]['lastPrice'] / A.full_tick[stock_code]['lastClose'] - 1, 3))
+						if stock_code not in A.lst_condition_0_met:
+							if A.full_tick[stock_code]['lastPrice'] / A.full_tick[stock_code]['lastClose'] - 1 < rt_threshold_0:
+								A.lst_condition_0_met.append(stock_code)
+								A.lst_condition_0_met = list(set(A.lst_condition_0_met))
+								print(stock_code, '00000000', A.lst_condition_0_met)
+						if stock_code not in A.lst_condition_1_met:
+							if A.full_tick[stock_code]['lastPrice'] / A.full_tick[stock_code]['lastClose'] - 1 < rt_threshold_1:
+								A.lst_condition_1_met.append(stock_code)
+								A.lst_condition_1_met = list(set(A.lst_condition_1_met))
+								print(stock_code, '11111111', A.lst_condition_1_met)
+								# 这一部分，只判断，不下单，所以判断完就返回
+						if stock_code in A.lst_condition_0_met and stock_code not in A.lst_condition_1_met:
+							print(stock_code, '初步符合条件')
+						continue
+					else:
+						continue
+				# 对于所有未进入涨停炸板判断的，进行continue
+				else:
+					continue
+					
+		
+		
+		elif A.paras['upstop_type'] == 'E接近涨停的比例' and round(A.full_tick[stock_code]['open'],2) != A.dict_up_stop_price[stock_code]:
+			# 如果设置为0.02，则主板股票，0.1 - 0.02 = 0.08，则涨幅大于0.08就下单买入了
+			
+			rt_threshold = A.dict_up_stop_price[stock_code] / A.full_tick[stock_code]['lastClose'] - 1 - A.close_rt
+			# print(stock_code, round(A.full_tick[stock_code]['lastPrice'],2) / round(A.full_tick[stock_code]['lastClose'],2) - 1)
+			# 涨停或接近涨停，就买入
+			if round(A.full_tick[stock_code]['lastPrice'],2) == A.dict_up_stop_price[stock_code] or round(A.full_tick[stock_code]['lastPrice'],2) / round(A.full_tick[stock_code]['lastClose'],2) - 1 > rt_threshold:
+				# print(stock_code, A.dict_up_stop_price[stock_code] / A.full_tick[stock_code]['lastPrice'] - 1, A.close_rt)
+				pass
+			else:
+				continue
+		
+		else:
+			continue
+		
+		if A.after_running_upstop:
+			if stock_code in A.lst_upstop_happened:
+				# print(f"{stock_code}在读到或加入时已经涨停，跳过")
+				continue
+				
+		# print(stock_code, A.full_tick[stock_code]['lastClose'] * A.dict_floatVol[stock_code] / 1e8)
+		if A.paras['price_judge']:
+			if A.full_tick[stock_code]['lastClose'] < A.min_price_threshold or A.full_tick[stock_code]['lastClose'] > A.max_price_threshold:
+				continue
+		
+		if A.paras['market_value_judge']:
+			if A.full_tick[stock_code]['lastClose'] * A.dict_floatVol[stock_code] / 1e8 < A.min_market_value_threshold or A.full_tick[stock_code]['lastClose'] * A.dict_floatVol[stock_code] / 1e8 > A.max_market_value_threshold:
+				continue
+				
+		
+		if A.paras['open_vs_lastclose_judge']:
+			# print(stock_code, round(A.full_tick[stock_code]['open'],2) / round(A.full_tick[stock_code]['lastClose'],2) - 1 , A.paras['open_vs_lastclose_rt'])
+			if round(A.full_tick[stock_code]['open'],2) / round(A.full_tick[stock_code]['lastClose'],2) - 1 < A.open_vs_lastclose_range[0] \
+				or round(A.full_tick[stock_code]['open'],2) / round(A.full_tick[stock_code]['lastClose'],2) - 1 > A.open_vs_lastclose_range[1]:
+				continue
+		
+		if A.paras['exchange_judge'] == '换手率大于':
+			# 成交量是手数，需要乘以100
+			exchange_rt = A.full_tick[stock_code]['volume'] * 100 / A.dict_floatVol[stock_code]
+			print(stock_code, exchange_rt)
+			if exchange_rt <= A.paras['exchange_threshold']:
+				continue
+			else:
+				pass
+		
+		if A.paras['exchange_judge'] == '换手率小于':
+			exchange_rt = A.full_tick[stock_code]['volume'] * 100 / A.dict_floatVol[stock_code]
+			print(stock_code, exchange_rt)
+			if exchange_rt >= A.paras['exchange_threshold']:
+				continue
+			else:
+				pass
+		
+		
+		if A.oscillation_judge:
+			if (A.full_tick[stock_code]['high'] - A.full_tick[stock_code]['low']) / A.full_tick[stock_code]['lastClose'] < A.oscillation_range[0] or (A.full_tick[stock_code]['high'] - A.full_tick[stock_code]['low']) / A.full_tick[stock_code]['lastClose'] > A.oscillation_range[1]:
+				continue
+			else:
+				pass
+		if A.buy_vs_traded_judge:
+			# 只在涨停时进行判断
+			# print('tt', stock_code, round(A.full_tick[stock_code]['lastPrice'], 2), A.dict_up_stop_price[stock_code])
+			if round(A.full_tick[stock_code]['bidPrice'][0], 2) == A.dict_up_stop_price[stock_code]:
+				# 封成比小于设定的值，则返回
+				# print('hh', stock_code, A.full_tick[stock_code]['bidVol'][0],  A.full_tick[stock_code]['volume'])
+				if A.full_tick[stock_code]['bidVol'][0] / A.full_tick[stock_code]['volume'] <= A.buy_vs_traded_threshold:
+					continue
+					# 大于,则不返回，可以进行下一步
+				else:
+					pass
+			# 不涨停，则不进行此指标的判断
+			else:
+				pass
+		
+		if A.volume_judge:
+			if A.full_tick[stock_code]['volume'] <= A.dealed_volume_threshold:
+				# print(stock_code,'成交量条件未满足')
+				continue
+		if A.amount_judge:
+			# print(stock_code, A.full_tick[stock_code]['amount'], A.dealed_amount_threshold, '成交金额条件未满足')
+			if A.full_tick[stock_code]['amount'] <= A.dealed_amount_threshold:
+				
+				continue
+		
+		buy(C, stock_code)   #进行买入动作
+		if A.paras['upstop_type'] in ['D1一字炸封', 'D2非一炸封', 'D3所有炸封']:
+			if stock_code in A.lst_condition_0_met:
+				A.lst_condition_0_met.remove(stock_code)
+			
+			
+	# 整个for循环结束，做一次数据拷贝
+	if A.paras['upstop_type'] in ['D1一字炸封', 'D2非一炸封', 'D3所有炸封']:
+		# lst_in_explosion = list(set(A.lst_condition_0_met + A.lst_condition_1_met))
+		# print('发生炸板的：', lst_in_explosion)
+		A.dict_last_second_data = copy.deepcopy(A.full_tick)
+		
+	time22 = time.time()
+	consumed_time = time22 - time11
+	print('第%s轮监控，耗时: %.2f秒' % (A.counter_for_monitoring, consumed_time), '本轮监控了%s只股票' % n)
+	A.fake_round += 1
+	A.counter_for_monitoring += 1  #监控多少次计数
+	return
+
+def buy(C, stock_code):
+	"""执行买入操作"""
+	# print('buy', stock_code)
+	amount_for_buying = min(A.available_cash, A.amount_for_buying)
+	trade_price = round(A.dict_up_stop_price[stock_code],2)  # 涨停价下单
+	vol = int(amount_for_buying / trade_price / 100) * 100 # 计算可买手数   买入数量 向下取整到100的整数倍
+	
+	if (stock_code[:] != '68' and vol >= 100) or (stock_code[:2] == '68' and vol >= 200):
+		msg = f"以{trade_price}元，买入 {stock_code, vol}股"
+		print(msg)
+		passorder(A.buy_code, 1101, A.acct, stock_code, 11, trade_price, vol, '买入', 2, A.buy_remark, C)
+		A.available_cash -= trade_price * vol
+		A.lst_ordered_buy.append(stock_code)
+		A.lst_ordered_buy = list(set(A.lst_ordered_buy))
+	else:
+		print(stock_code, '买入股数不足交易所规定的要求，跳过')
+
+
+
+def get_paras(): # 从XML文件读取参数
+	"""从XML配置文件读取策略参数"""
+	tree = ET.parse(A.path3 + 'formulaLayout/开盘扫板.xml')
+	root = tree.getroot()
+	for control in root.findall('control'):
+		for variable in control.findall('variable'):
+			for item in variable.findall('item'):
+				name = item.get('name')
+				value = item.get('value')
+				note = item.get('note')
+				bind = item.get('bind')
+				A.paras[bind] = value
+				# print(f"{value}, {bind}")
+	
+	for key in A.paras.keys():
+		if key in ['price_gap', 'buy_amount', 'close_rt', 'exchange_threshold', 'open_vs_lastclose_threshold', 'oscillation_threshold', 'buy_vs_traded_threshold', 'dealed_volume_threshold', 'dealed_amount_threshold', 'cancel_seconds_interval']:
+			if len(A.paras[key]) != 0:
+				A.paras[key] = float(A.paras[key])
+			else:
+				while True:
+					print(f"【请注意】：{A.version}可能有部分输入框中未填写参数，请检查并填写！")
+					print("请填写参数后按'确定'按钮进行保存，然后，再重启策略！")
+					time.sleep(5)
+		else:
+			continue
+	for key in A.paras.keys():
+		if key in ['buy_no_kcb_stocks', 'buy_no_cyb_stocks', 'buy_no_ST_stocks', 'buy_no_positioned_stock', 'after_running_upstop', 'price_judge', 'market_value_judge', 'open_vs_lastclose_judge', 'oscillation_judge', 'buy_vs_traded_judge', 'volume_judge', 'amount_judge', 'cancel_order_by_time', 'cancel_order_by_volume', 'cancel_order_by_amount', 'cancel_order_by_buy_vs_traded_rt', 'cancel_all_orders_once']:
+			A.paras[key] = True if A.paras[key] == 'True' else False
+	
+	for key in A.paras.keys():
+		if key in ['askVol_or_askAmount', 'bidVol_or_bidAmount', 'limited_num_of_stocks']:
+			if len(A.paras[key]) != 0:
+				A.paras[key] = int(A.paras[key])
+			else:
+				while True:
+					print(f"【请注意】：{A.version}可能有部分输入框中未填写参数，请检查并填写！")
+					print("请填写参数后按'确定'按钮进行保存，然后，再重启策略！")
+					time.sleep(5)
+					
+	
+	
+	
+	# 对于3个列表的数值的处理
+	A.explosion_rt_and_seconds = A.paras['explosion_rt_and_seconds'].replace("，", ",").replace(" ", "")
+	A.explosion_rt_and_seconds = A.explosion_rt_and_seconds.split(",")
+	A.explosion_rt_and_seconds = list(map(float, A.explosion_rt_and_seconds))
+	
+	# 对于3个列表的数值的处理
+	A.price_range = A.paras['price_range'].replace("，", ",").replace(" ", "")
+	A.price_range = A.price_range.split(",")
+	A.price_range = list(map(float, A.price_range))
+	# print(A.price_range[0], A.price_range[1])
+	
+	A.market_value_range = A.paras['market_value_range'].replace("，", ",").replace(" ", "")
+	A.market_value_range = A.market_value_range.split(",")
+	A.market_value_range = list(map(float, A.market_value_range))
+	
+	A.open_vs_lastclose_range = A.paras['open_vs_lastclose_range'].replace("，", ",").replace(" ", "")
+	A.open_vs_lastclose_range = A.open_vs_lastclose_range.split(",")
+	A.open_vs_lastclose_range = list(map(float, A.open_vs_lastclose_range))
+	
+	A.oscillation_range = A.paras['oscillation_range'].replace("，", ",").replace(" ", "")
+	A.oscillation_range = A.oscillation_range.split(",")
+	A.oscillation_range = list(map(float, A.oscillation_range))
+	
+	A.cancel_volume_threshold = A.paras['cancel_volume_threshold'].replace("，", ",").replace(" ", "")
+	A.cancel_volume_threshold = A.cancel_volume_threshold.split(",")
+	A.cancel_volume_threshold = list(map(float, A.cancel_volume_threshold))
+	# print(A.cancel_volume_threshold[0], A.cancel_volume_threshold[1])
+	
+	A.cancel_amount_threshold = A.paras['cancel_amount_threshold'].replace("，", ",").replace(" ", "")
+	A.cancel_amount_threshold = A.cancel_amount_threshold.split(",")
+	A.cancel_amount_threshold = list(map(float, A.cancel_amount_threshold))
+	
+	
+	A.cancel_buy_vs_traded_threshold = A.paras['cancel_buy_vs_traded_threshold'].replace("，", ",").replace(" ", "")
+	A.cancel_buy_vs_traded_threshold = A.cancel_buy_vs_traded_threshold.split(",")
+	A.cancel_buy_vs_traded_threshold = list(map(float, A.cancel_buy_vs_traded_threshold))
+	
+	
+	# for key, value in A.paras.items():
+		# print(key, value, type(value))
+		
